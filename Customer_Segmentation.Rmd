@@ -1,0 +1,430 @@
+---
+title: "Customer Segmentation"
+author: "J Moses"
+date: "2024-07-15"
+output: html_document
+  
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE)
+
+# Libraries ----
+library(DBI)
+library(RSQLite)
+
+library(plotly)
+library(skimr)
+library(GGally)
+
+library(tidymodels)
+library(embed)
+library(textrecipes)
+library(vip)
+
+library(lubridate)
+library(tidyverse)
+```
+
+## This purpose of this analysis is to investigate a sales dataset to determine:
+ - methods of customer segmentation
+ - the likelihood of a customer purchasing again within 90 days.
+
+# Database:
+ The data for this project is imported from an SQLite file. The data is the open-source Chinook dataset.
+
+```{r}
+# Database connection ----
+
+con <- DBI::dbConnect(SQLite(), "data/Chinook_Sqlite.sqlite")
+# check the connection
+con
+```
+
+## Database Tables:
+
+```{r}
+dbListTables(con)
+
+# view all tables in the database
+dbListTables(con) %>% map(~ tbl(con, .))
+
+```
+
+## Import Invoices table
+
+```{r}
+invoices_tbl <- tbl(con, "Invoice") %>% collect()
+
+invoices_tbl <- invoices_tbl %>%
+    mutate(InvoiceDate = as_date(InvoiceDate))
+
+invoices_tbl %>% glimpse()
+
+# save the imported data for future use
+#invoices_tbl %>% write_rds("data/invoices_tbl.rds")
+
+```
+## Import Customers table
+
+```{r}
+customers_tbl <- tbl(con, "Customer") %>% collect()
+
+customers_tbl %>% glimpse()
+
+# save the imported data for future use
+#customers_tbl %>% write_rds("data/customers_tbl.rds")
+```
+
+## Import the Invoice lines table
+This table needs to be amended in order to be more useful for the analysis:
+- Genre, Album, Artist are added to the table.
+- The invoice and customer are also requried in this table to allow for trends to be examined by customer.
+
+```{r}
+invoice_lines_tbl <- tbl(con, "InvoiceLine") %>% #needs more information to be useful - pull it in too
+    left_join(
+        tbl(con, "Track") %>%
+            select(-UnitPrice) %>%
+            rename(TrackName = Name),
+        by = "TrackId"
+    ) %>%
+    left_join(
+        tbl(con, "Genre") %>% rename(GenreName = Name), by = "GenreId"
+    ) %>%
+    left_join(
+        tbl(con, "Album") %>% rename(AlbumTitle = Title), by = "AlbumId"
+    ) %>%
+    left_join(
+        tbl(con, "Artist") %>% rename(ArtistName = Name), by = "ArtistId"
+    ) %>%
+    left_join(
+        tbl(con, "Invoice") %>% select(InvoiceId, CustomerId), #needed to be able to mine for trends by customer
+        by = "InvoiceId"
+    ) %>%
+    select(-ends_with("Id"), starts_with("Invoice"), starts_with("Customer")) %>%
+    relocate(contains("Id"), .before = 1) %>%
+    collect()
+
+invoice_lines_tbl %>% glimpse()
+
+# save the imported data for future use
+#invoice_lines_tbl %>% write_rds("data/invoice_lines_tbl.rds")
+
+# check the dataset
+invoice_lines_tbl %>% skim()
+
+
+```
+
+## Close the database connection
+
+```{r}
+DBI::dbDisconnect(con)
+
+```
+
+# Feature Engineering
+This section attempts to create variables that might be useful for the analysis.
+Variable creation and reduction are both important here. There needs to be a sufficient number of useful variables that help to improve a model accuracy, without overfitting (not being useful for new data).
+Large numbers of similar types of variables are reduced down to mapped components or principal component variables for the analysis.
+
+## Focus: Product relationship between customer and artist
+- invoice lines table
+
+```{r}
+invoice_lines_tbl %>% distinct(ArtistName)
+
+## Pivot Longer (Dummy) ----
+customer_artists_tbl <- invoice_lines_tbl %>% # what artists are customers buying from?
+    select(CustomerId, ArtistName) %>%
+    count(CustomerId, ArtistName) %>% # count frequency
+    pivot_wider(    #make dummy columns by pivoting the data - for each customer, which artists?
+        names_from = ArtistName,
+        values_from = n,
+        values_fill = 0,
+        names_prefix = "artist_",
+        names_sep = "_"
+    )
+
+customer_artists_tbl
+# save the data frame
+#customer_artists_tbl %>% write_rds("data/customer_artists_tbl.rds")
+
+```
+
+The recipes library is used in the below dimensionality reduction code in order to automate the process. A seed is set in order to make it reproducable.
+
+```{r}
+# Dimensionality Reduction with UMAP ----
+
+recipe_spec_umap <- recipe(~ ., customer_artists_tbl) %>%
+    step_umap(
+        -CustomerId, 
+        num_comp = 20,   #condenses the information into 20 columns
+        retain = FALSE,
+        seed = c(123, 123),
+    )
+
+
+customer_artists_umap_tbl <- recipe_spec_umap %>% prep() %>% juice()
+
+customer_artists_umap_tbl
+# save the data frame
+#customer_artists_umap_tbl %>% write_rds("data/customer_artists_umap_tbl.rds")
+```
+
+## Which customers are buying from similar artists?
+The 2D plot below shows all customers within the context of the first 2 of the 20 dimensionality-reduced variables (UMAP variables). These can later be used to classify customers into different groups.
+
+```{r}
+g <- customer_artists_umap_tbl %>%
+    ggplot(aes(UMAP01, UMAP02)) +
+    geom_point(aes(text = CustomerId), alpha = 0.5)
+
+ggplotly(g)
+```
+
+This can also be plotted in 3D, with up to 4 of the UMAP variables (one can be shown as the colour)
+
+```{r}
+customer_artists_umap_tbl %>%
+    plot_ly(x = ~ UMAP01, y = ~ UMAP02, z = ~ UMAP03, color = ~ UMAP04, 
+            text = ~ CustomerId) %>%
+    add_markers()
+
+```
+
+In addition to the mapped variables, the invoice lines data frame can be investigated for information on each individual customer's preferences.
+
+This could include determining the preferred artist for each customer.
+See below the most popular artists of customer numbers 16, 35, and 55:
+
+```{r}
+invoice_lines_tbl %>%
+    filter(CustomerId %in% c(35, 55, 16)) %>%
+    count(CustomerId, ArtistName) %>%
+    group_by(CustomerId) %>%
+    arrange(-n, .by_group = TRUE) %>%
+    slice(1:5)
+```
+
+Or the preferred artist and genre of customer numbers 32 and 52:
+```{r}
+invoice_lines_tbl %>%
+    filter(CustomerId %in% c(32, 52)) %>%
+    count(CustomerId, GenreName, ArtistName) %>%
+    group_by(CustomerId) %>%
+    arrange(-n, .by_group = TRUE) %>%
+    slice(1:5)
+```
+
+## Aggregation Features
+In this section, the length of an individual song is investigated as a potential variable.
+The various lengths of songs are divided into 5 buckets, depending on where the song length is compared to all of the other songs. In other words, the shortest songs will be in the first, and so on until the longest songs are in the final bucket.
+
+```{r}
+customer_song_len_tbl <- invoice_lines_tbl %>%
+    select(CustomerId, Milliseconds) %>%
+    group_by(CustomerId) %>%
+    summarise(
+        enframe(quantile(Milliseconds, probs = c(0, 0.25, 0.5, 0.75, 1)))
+    ) %>%
+    ungroup() %>%
+    mutate(name = str_remove_all(name, "%")) %>%
+    pivot_wider(
+        names_from = name,
+        values_from = value, 
+        names_prefix = "song_len_q"
+    )
+
+customer_song_len_tbl %>%
+    arrange(-song_len_q100)
+
+```
+
+## Purchase relationships
+This section looks at creating variables to model date (i.e. seasonal) variables, and price features.
+This investigation uses the invoices data frame.
+
+```{r}
+max_date <- max(invoices_tbl$InvoiceDate)
+
+customer_invoice_tbl <- invoices_tbl %>%
+    select(CustomerId, InvoiceDate, Total) %>%
+    group_by(CustomerId) %>%
+    summarise(
+        
+        #Date features
+        inv_most_recent_purchase = (max(InvoiceDate) - max_date) / ddays(1), #when was most recent purchase?
+        inv_tenure               = (min(InvoiceDate) - max_date) / ddays(1), #when was first purchase?
+        
+        #Price features
+        inv_count = n(),  #how many invoices?
+        inv_sum = sum(Total, na.rm = TRUE), #total purchase amount?
+        inv_avg = mean(Total, na.rm = TRUE)  #average purchase amount?
+    )
+
+customer_invoice_tbl %>%
+    ggpairs(
+        columns = 2:ncol(.),
+        title = "Customer Aggregated Invoice Features"
+        
+    )
+
+# save the data frame
+#customer_invoice_tbl %>% write_csv("data/customer_invoice_tbl.rds")
+```
+
+## Customer Features
+This section looks at the customer table to determine useful variables from customer data
+
+```{r}
+customers_tbl %>% skim()
+
+## Joining ----
+
+customers_joined_tbl <- customers_tbl %>%  # selecting elements that we want
+    select(contains("Id"), PostalCode, Country, City) %>%
+    left_join(
+        customer_invoice_tbl, by = "CustomerId"
+    ) %>%
+    left_join(
+        customer_song_len_tbl, by = "CustomerId"
+    ) %>%
+    left_join(
+        customer_artists_umap_tbl, by = "CustomerId"
+    ) %>%
+    rename_at(.vars = vars(starts_with("UMAP")), .funs = ~ str_glue("artist_{.}"))
+
+customers_joined_tbl %>% glimpse()
+
+customers_joined_tbl %>% skim()
+
+# save the data frame
+#customers_joined_tbl %>% write_rds("data/customers_joined_tbl.rds")
+
+```
+
+# Modelling
+With the different variables created, the modelling can now begin.
+The purpose of the model is to determine:
+    What is the likelihood of a customer making a new purchase within 90 days?
+    
+In this case, as single model has been implemented, "XGBoost".
+In a typical analysis, multiple kinds of models would be created, in a similar way to the following XGBoost modelling process. These would then be compared for accuracy and overfitting, the best models selected, and used to make a more accurate prediction.
+"Ensembles" can also be made from these multiple models, so that they work together to give a better prediction.
+
+For the purpose of this project, only a single XGBoost model has been created however.
+
+## Make Target Feature
+This creates the "target" variable - the likelihood that a customer will make a new purchase within 90 days.
+```{r}
+full_data_tbl <- customers_joined_tbl %>%
+    mutate(Target = ifelse(inv_most_recent_purchase >= -90, 1, 0)) %>%
+    mutate(Target = as.factor(Target)) %>%
+    select(-inv_most_recent_purchase) %>%
+    relocate(Target, .after = CustomerId)
+
+# save data frame
+#full_data_tbl %>% write_rds("data/full_data_tbl.rds")
+
+```
+
+## split data into training and testing portions
+This is to ensure that a model can be tested on "new" data to verify that it is indeed as good as expected.
+```{r}
+set.seed(123)
+splits <- initial_split(full_data_tbl, prop = 0.80) # 80% training data,  20% for testing
+
+# save
+#write_rds(splits, "data/splits.rds")
+
+```
+
+## Embedding recipe
+```{r}
+recipe_spec_hash <- recipe(Target ~ ., training(splits)) %>%
+    add_role(CustomerId, new_role = "Id") %>%
+    
+    step_dummy_hash(Country, City, PostalCode, num_terms = 15) #hashing compresses the wide data into fewer columns 
+
+recipe_spec_hash %>% prep() %>% juice() %>% glimpse()
+
+
+```
+
+## Begin the modelling
+```{r}
+wflw_fit_xgb_hash <- workflow() %>%
+    add_model(
+        spec = boost_tree(mode = "classification") %>% set_engine("xgboost")
+    ) %>%
+    add_recipe(recipe_spec_hash) %>%
+    fit(training(splits))
+
+
+bind_cols(
+    wflw_fit_xgb_hash %>% predict(testing(splits), type = "prob"),
+    testing(splits)
+) %>%
+    yardstick::roc_auc(Target, .pred_1)
+
+
+```
+
+## Review the relative importance of different variables
+The histogram shows the most important variables:
+```{r}
+wflw_fit_xgb_hash$fit$fit$fit %>% vip() #gives a histogram of the most important features
+
+```
+
+We can look at different variables - of particular interest are the ones highest on the histogram
+for example:
+
+### Length of time as a customer
+```{r}
+full_data_tbl %>%
+    ggplot(aes(inv_tenure, fill = Target)) +
+    geom_density(alpha = 0.5)
+
+full_data_tbl$inv_tenure %>% range()
+
+```
+### Song length
+```{r}
+full_data_tbl %>%
+    ggplot(aes(song_len_q50, fill = Target)) +
+    geom_density(alpha = 0.5)
+
+full_data_tbl$song_len_q50 %>% range()
+```
+### Particular Artist Preferences (as modelled by UMAP19)
+```{r}
+full_data_tbl %>%
+    ggplot(aes(artist_UMAP19, fill = Target)) +
+    geom_density(alpha = 0.5)
+
+full_data_tbl$artist_UMAP19 %>% range()
+
+```
+
+# Make Full Predictions:
+```{r}
+bind_cols(
+    wflw_fit_xgb_hash %>% predict(full_data_tbl, type = "prob"),
+    customers_joined_tbl
+) %>%
+    write_rds("data/customer_predictions_tbl.rds")
+
+```
+
+This analysis determined relationships between customers through the UMAP variables, combined various data tables into more useful data frames for analysis, and reduced dimensionality of the models.
+
+The result is the behaviour of customers, along with a model of the 90 day likelihood of a customer purchasing again have been created.
+The full details of this can be viewed in the shiny app.
